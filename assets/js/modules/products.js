@@ -1,6 +1,7 @@
 import { sb, must } from '../core/supa.js';
 import { h, field, formData, run, table, money, modal, select, num } from '../core/ui.js';
 import { fmtDateTime } from '../core/time.js';
+import { paySettings, printSaleReceipt } from '../core/receipt.js';
 
 export async function render(root, ctx) {
   const out = h('div', {}), banner = h('div', { class: 'banner', hidden: true });
@@ -23,12 +24,15 @@ export async function render(root, ctx) {
     modal(`Sell ${p.name}`, close => {
       const f = h('form', { class: 'form', onsubmit: async e => {
         e.preventDefault(); const d = formData(f);
-        const ok = await run(async () => must(await sb.from('sl_product_sales').insert({ business_id: ctx.biz.id, product_id: p.id, qty: Number(d.qty), unit_price: p.price, method: d.method, created_by: ctx.user.id })), 'Sale recorded');
-        if (ok) { close(); load(); }
+        const sale = await run(async () => must(await sb.from('sl_product_sales').insert({ business_id: ctx.biz.id, product_id: p.id, qty: Number(d.qty), unit_price: p.price, method: d.method, created_by: ctx.user.id }).select().single()), 'Sale recorded');
+        if (sale) { close(); load(); try { if ((await paySettings(ctx.biz)).receipt_auto_print) printSaleReceipt(ctx, sale, p); else showPrint(sale, p); } catch { /* receipt is optional */ } }
       } }, field('Quantity', h('input', { name: 'qty', type: 'number', min: '1', max: p.stock, value: 1, required: true })), field('Method', select('method', [['cash', 'Cash'], ['card', 'Card']], 'cash')),
       h('p', { class: 'sub full' }, `${money(p.price, ctx.cur)} each · ${p.stock} in stock. The price and stock are checked by the database.`), h('div', { class: 'acts full' }, h('button', { type: 'button', class: 'btn', onclick: close }, 'Cancel'), h('button', { class: 'btn pri' }, 'Record sale')));
       return f;
     });
+  }
+  function showPrint(sale, p) {
+    modal('Sale recorded', close => h('div', {}, h('p', {}, `${p.name} x${sale.qty}`), h('div', { class: 'acts' }, h('button', { class: 'btn', onclick: close }, 'Done'), h('button', { class: 'btn pri', onclick: () => { printSaleReceipt(ctx, sale, p); close(); } }, 'Print receipt'))));
   }
   function edit(p) {
     modal(p ? 'Edit product' : 'New product', close => {

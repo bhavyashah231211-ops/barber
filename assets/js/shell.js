@@ -60,7 +60,8 @@ export async function startShell({ app, root, modules, allowed }) {
     root.replaceChildren(h('div', { class: 'app' }, side, h('main', { class: 'main' },
       h('div', { class: 'top' }, h('button', { class: 'btn burger', 'aria-label': 'Menu', onclick: () => side.classList.toggle('open') }, '☰'), title), banner, view)));
     const days = Math.ceil((new Date(biz.trial_ends_at) - Date.now()) / 864e5);
-    if (!subOk(biz)) { banner.hidden = false; banner.textContent = 'Your subscription is not active: online booking and new payments are paused. Contact CBSystem to reactivate.'; }
+    if (biz.sub_status === 'pending') { banner.hidden = false; banner.textContent = 'Your account is waiting to be activated by CBSystem. You can set everything up now; online booking and payments open once it is activated.'; }
+    else if (!subOk(biz)) { banner.hidden = false; banner.textContent = 'Your subscription is not active: online booking and new payments are paused. Contact CBSystem to reactivate.'; }
     else if (biz.sub_status === 'trial' && days <= 7) { banner.hidden = false; banner.textContent = `Your trial ends in ${Math.max(days, 0)} day(s).`; }
 
     let token = 0;

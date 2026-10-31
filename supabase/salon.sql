@@ -2,8 +2,8 @@
 -- Run once in Supabase > SQL Editor. Safe to re-run.
 -- Then: Authentication > Providers > Email: keep "Confirm email" ON (staff invites and customer matching rely on it).
 --       Authentication > URL Configuration: add your site URL plus /admin/, /staff/ and /customer/ to Redirect URLs.
--- You (platform owner): insert into sl_platform_admins values ('<your auth user id>');
---       select sl_set_plan('<business id>','pro','active');   -- plans: trial | starter | pro
+-- You (platform owner): insert into sl_platform_admins select id from auth.users where email = 'YOUR-EMAIL';
+--       then use the /platform/ page to activate, suspend and set plans for each tenant.
 
 create extension if not exists btree_gist with schema extensions;
 do $$ begin create extension if not exists pg_net; exception when others then raise notice 'pg_net unavailable: webhooks disabled'; end $$;
@@ -22,7 +22,7 @@ create table if not exists sl_businesses(
   accent text not null default '#2dd4a0' check (accent ~ '^#[0-9a-fA-F]{6}$'),
   phone text, address text,
   plan text not null default 'trial' check (plan in ('trial','starter','pro')),
-  sub_status text not null default 'trial' check (sub_status in ('trial','active','past_due','cancelled')),
+  sub_status text not null default 'trial' check (sub_status in ('trial','active','past_due','cancelled','pending')),
   trial_ends_at timestamptz not null default now() + interval '30 days',
   max_staff int not null default 3 check (max_staff >= 1),
   max_branches int not null default 1 check (max_branches >= 1),
@@ -176,6 +176,39 @@ create table if not exists sl_integrations(            -- outbound webhook per b
 
 create table if not exists sl_platform_admins(user_id uuid primary key references auth.users(id) on delete cascade);
 
+
+-- upgrade for databases created before 'pending' existed
+do $$ begin
+  alter table sl_businesses drop constraint if exists sl_businesses_sub_status_check;
+  alter table sl_businesses add constraint sl_businesses_sub_status_check check (sub_status in ('trial','active','past_due','cancelled','pending'));
+end $$;
+
+create table if not exists sl_platform_settings(key text primary key, value text not null);   -- e.g. signup_mode = open | approval
+
+-- per-business payment + receipt options (no secrets here; staff can read, admins write)
+create table if not exists sl_pay_settings(
+  business_id uuid primary key references sl_businesses(id) on delete cascade,
+  currency_code text not null default 'gbp' check (currency_code ~ '^[a-z]{3}$'),
+  link_template text check (link_template ~ '^https://' and length(link_template) <= 500),
+  terminal_name text check (length(terminal_name) <= 40),
+  terminal_url text check (terminal_url ~* '^[a-z][a-z0-9+.-]*://' and terminal_url !~* '^(javascript|data|vbscript|file|blob):' and length(terminal_url) <= 500),
+  stripe_enabled boolean not null default false,           -- set only by the salon-pay edge function
+  receipt_paper text not null default '80mm' check (receipt_paper in ('58mm','80mm','a4')),
+  receipt_copies int not null default 1 check (receipt_copies between 1 and 3),
+  receipt_auto_print boolean not null default false,
+  receipt_header text check (length(receipt_header) <= 200),
+  receipt_footer text check (length(receipt_footer) <= 200),
+  vat_number text check (length(vat_number) <= 30),
+  updated_at timestamptz not null default now());
+
+-- tenant's own Stripe keys. No policies and no grants: only the salon-pay edge function (service role) can touch it.
+create table if not exists sl_payment_secrets(
+  business_id uuid primary key references sl_businesses(id) on delete cascade,
+  stripe_secret text, stripe_webhook_secret text);
+
+alter table sl_payments add column if not exists external_id text;   -- e.g. Stripe checkout session id (prevents double-recording)
+create unique index if not exists sl_payments_ext_u on sl_payments(business_id, external_id) where external_id is not null;
+
 -- ───────────────────────── helpers ─────────────────────────
 create or replace function sl_role(p_biz uuid) returns text language sql stable security definer set search_path = public as
 $$ select role from sl_profiles where user_id = auth.uid() and business_id = p_biz $$;
@@ -290,12 +323,13 @@ $$ select b.id, b.name, b.accent, b.currency, b.phone, b.address, sl_biz_ok(b.id
 
 create or replace function sl_create_business(p_name text, p_slug text, p_full_name text, p_phone text default null)
 returns uuid language plpgsql security definer set search_path = public as $$
-declare bid uuid; br uuid; em text;
+declare bid uuid; br uuid; em text; st text;
 begin
   if auth.uid() is null then raise exception 'Sign in first' using errcode = '42501'; end if;
   select email into em from auth.users where id = auth.uid();
+  st := case coalesce((select value from sl_platform_settings where key = 'signup_mode'), 'open') when 'approval' then 'pending' else 'trial' end;
   begin
-    insert into sl_businesses(slug, name, owner_id, phone) values (lower(trim(p_slug)), trim(p_name), auth.uid(), nullif(trim(p_phone), '')) returning id into bid;
+    insert into sl_businesses(slug, name, owner_id, phone, sub_status) values (lower(trim(p_slug)), trim(p_name), auth.uid(), nullif(trim(p_phone), ''), st) returning id into bid;
   exception when unique_violation then raise exception 'That web address is already taken';
             when check_violation then raise exception 'Use 2-39 lowercase letters, numbers or dashes for the web address';
   end;
@@ -518,6 +552,44 @@ begin
     'new_customers', (select count(*) from sl_customers where business_id = p_business and created_at >= f and created_at < t));
 end $$;
 
+
+-- ───────────── platform owner console (only users listed in sl_platform_admins) ─────────────
+create or replace function sl_is_platform_admin() returns boolean language sql stable security definer set search_path = public as
+$$ select exists (select 1 from sl_platform_admins where user_id = auth.uid()) $$;
+
+create or replace function sl_platform_list()
+returns table(id uuid, slug text, name text, owner_email text, plan text, sub_status text, trial_ends_at timestamptz, max_staff int, max_branches int, staff_count bigint, bookings_30d bigint, created_at timestamptz)
+language plpgsql stable security definer set search_path = public as $$
+begin
+  if not sl_is_platform_admin() then raise exception 'Not allowed' using errcode = '42501'; end if;
+  return query
+  select b.id, b.slug, b.name, u.email::text, b.plan, b.sub_status, b.trial_ends_at, b.max_staff, b.max_branches,
+         (select count(*) from sl_staff s where s.business_id = b.id and s.active),
+         (select count(*) from sl_bookings k where k.business_id = b.id and k.created_at > now() - interval '30 days'),
+         b.created_at
+  from sl_businesses b left join auth.users u on u.id = b.owner_id order by b.created_at desc;
+end $$;
+
+create or replace function sl_platform_update(p_business uuid, p_plan text, p_status text, p_trial_ends timestamptz, p_max_staff int, p_max_branches int)
+returns void language plpgsql security definer set search_path = public as $$
+begin
+  if not sl_is_platform_admin() then raise exception 'Not allowed' using errcode = '42501'; end if;
+  update sl_businesses set plan = p_plan, sub_status = p_status, trial_ends_at = coalesce(p_trial_ends, trial_ends_at),
+         max_staff = p_max_staff, max_branches = p_max_branches where id = p_business;
+  if not found then raise exception 'Business not found'; end if;
+end $$;
+
+create or replace function sl_platform_signup_mode(p_mode text default null)
+returns text language plpgsql security definer set search_path = public as $$
+begin
+  if not sl_is_platform_admin() then raise exception 'Not allowed' using errcode = '42501'; end if;
+  if p_mode is not null then
+    if p_mode not in ('open','approval') then raise exception 'Invalid mode'; end if;
+    insert into sl_platform_settings(key, value) values ('signup_mode', p_mode) on conflict (key) do update set value = excluded.value;
+  end if;
+  return coalesce((select value from sl_platform_settings where key = 'signup_mode'), 'open');
+end $$;
+
 -- ───────────────────────── RLS ─────────────────────────
 do $$ declare t text; begin
   for t in select tablename from pg_tables where schemaname = 'public' and tablename like 'sl\_%' loop
@@ -578,6 +650,12 @@ create policy sl_sales_r on sl_product_sales for select to authenticated using (
 drop policy if exists sl_sales_i on sl_product_sales;
 create policy sl_sales_i on sl_product_sales for insert to authenticated with check (sl_is_staff(business_id) and created_by = auth.uid() and sl_biz_ok(business_id));
 
+
+drop policy if exists sl_pay_settings_r on sl_pay_settings;
+create policy sl_pay_settings_r on sl_pay_settings for select to authenticated using (sl_is_staff(business_id));
+drop policy if exists sl_pay_settings_w on sl_pay_settings;
+create policy sl_pay_settings_w on sl_pay_settings for all to authenticated using (sl_is_admin(business_id)) with check (sl_is_admin(business_id));
+
 -- ───────────────────────── grants ─────────────────────────
 grant select on sl_businesses, sl_branches, sl_profiles, sl_staff, sl_customers, sl_services, sl_staff_services, sl_business_hours,
                 sl_staff_availability, sl_bookings, sl_payments, sl_products, sl_product_sales, sl_integrations to authenticated;
@@ -591,6 +669,9 @@ grant update (full_name, email, phone, notes) on sl_customers to authenticated;
 grant update (status, notes) on sl_bookings to authenticated;
 grant insert on sl_payments to authenticated;
 grant update (status, note) on sl_payments to authenticated;
+grant select on sl_pay_settings to authenticated;
+grant insert (business_id, currency_code, link_template, terminal_name, terminal_url, receipt_paper, receipt_copies, receipt_auto_print, receipt_header, receipt_footer, vat_number) on sl_pay_settings to authenticated;
+grant update (currency_code, link_template, terminal_name, terminal_url, receipt_paper, receipt_copies, receipt_auto_print, receipt_header, receipt_footer, vat_number) on sl_pay_settings to authenticated;
 
 do $$ declare f regprocedure; begin
   for f in select p.oid::regprocedure from pg_proc p join pg_namespace n on n.oid = p.pronamespace

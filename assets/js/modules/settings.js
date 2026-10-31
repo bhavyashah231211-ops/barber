@@ -2,6 +2,7 @@ import { sb, must } from '../core/supa.js';
 import { h, field, formData, run, table, modal, select, copyText, toast } from '../core/ui.js';
 import { loadStaff, loadBranches } from '../core/data.js';
 import { DAYS, hhmm, fmtDate } from '../core/time.js';
+import { paymentSettingsCard } from './payment-settings.js';
 
 const ORDER = [1, 2, 3, 4, 5, 6, 0], EVENTS = [['booking.created', 'Booking created'], ['booking.cancelled', 'Booking cancelled'], ['payment.created', 'Payment recorded']];
 
@@ -77,7 +78,7 @@ export async function render(root, ctx) {
 
   root.append(
     h('div', { class: 'card' }, h('h2', {}, 'Your booking link'), h('p', { class: 'sub' }, 'Share this link or put it on your website and social profiles.'), h('div', { class: 'bar' }, h('input', { class: 'grow', readonly: true, value: link, onfocus: e => e.target.select() }), h('button', { class: 'btn', onclick: () => copyText(link) }, 'Copy'))),
-    h('div', { class: 'card' }, h('h2', {}, 'Business'), pf),
+    h('div', { class: 'card' }, h('h2', {}, 'Business'), pf), paymentSettingsCard(ctx),
     h('div', { class: 'card' }, h('div', { class: 'bar' }, h('h2', { class: 'grow' }, 'Branches & opening hours'), h('button', { class: 'btn pri', onclick: () => editBranch(null) }, '+ Add branch')), brOut),
     h('div', { class: 'card' }, h('h2', {}, 'Subscription'), subOut), h('div', { class: 'card' }, h('h2', {}, 'Integrations'), intOut));
   loadBranchesCard().catch(e => brOut.replaceChildren(h('p', { class: 'err' }, e.message))); loadIntegration().catch(e => intOut.replaceChildren(h('p', { class: 'err' }, e.message)));
